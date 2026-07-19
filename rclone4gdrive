@@ -115,10 +115,19 @@ init_cmd() {
   fi
 
   SCRIPT_DIR=`dirname "$0"`
-  TARGET_BIN="$HOME/bin/"
+  # Deploy into ~/bin/rclone4gdrive/ as a DIRECTORY. The systemd unit
+  # rclone-fail.service runs %h/bin/rclone4gdrive/rclone-fail-handler.sh and the
+  # PATH entry below adds $HOME/bin/rclone4gdrive, so both require this to be a
+  # directory, not a flat copy into ~/bin/. The trailing '/*' skips hidden items
+  # such as .git and .gitignore.
+  TARGET_BIN="$HOME/bin/rclone4gdrive"
+  if [ -e "$TARGET_BIN" ] && [ ! -d "$TARGET_BIN" ]; then
+    echo "Removing stale non-directory at $TARGET_BIN (left over from a previous init)..."
+    rm -f "$TARGET_BIN"
+  fi
   mkdir -p "$TARGET_BIN"
   echo "Copying $SCRIPT_DIR to $TARGET_BIN ..."
-  cp -a "$SCRIPT_DIR"/* "$TARGET_BIN"
+  cp -a "$SCRIPT_DIR"/* "$TARGET_BIN"/
 
   BASHRC="$HOME/.bashrc"
   PATH_LINE='export PATH="$HOME/bin/rclone4gdrive:$PATH"'

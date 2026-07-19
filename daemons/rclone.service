@@ -6,8 +6,8 @@ OnFailure=rclone-fail.service
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/rclone bisync gdrive: %h/gdrive/ --drive-skip-gdocs --create-empty-src-dirs --log-level=ERROR
-# Ensure systemd considers non-zero exit as a failure
-SuccessExitStatus=0
+# For Type=oneshot any non-zero exit is already treated as failure, which
+# triggers OnFailure=rclone-fail.service above.
 StandardOutput=journal
 StandardError=journal
 

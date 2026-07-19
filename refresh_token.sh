@@ -26,28 +26,28 @@ if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ] || [ -z "$REFRESH_TOKEN" ]; th
 fi
 
 # --- REQUEST NEW ACCESS TOKEN ---
-# Request a new access token from Google's OAuth2 endpoint
-TOKEN=`curl -s \
-  -d client_id="$CLIENT_ID" \
-  -d client_secret="$CLIENT_SECRET" \
-  -d refresh_token="$REFRESH_TOKEN" \
-  -d grant_type=refresh_token \
-  https://oauth2.googleapis.com/token`
+# Request a new access token from Google's OAuth2 endpoint.
+# The POST body is piped through stdin (not passed as command-line -d flags) so
+# that the client_secret and refresh_token are not exposed to other users via ps.
+BODY="client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}&refresh_token=${REFRESH_TOKEN}&grant_type=refresh_token"
+TOKEN=`printf '%s' "$BODY" | curl -s -X POST -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @- https://oauth2.googleapis.com/token`
 
-# Extract access_token and expiry from the response
+# Extract access_token and expires_in from the response
 ACCESS_TOKEN=`echo "$TOKEN" | jq -r '.access_token'`
-EXPIRY=`echo "$TOKEN" | jq -r '.expires_in'`
+EXPIRES_IN=`echo "$TOKEN" | jq -r '.expires_in'`
 
 # --- CHECK ---
 # Ensure the access token and expiry were obtained
-if [ -z "$ACCESS_TOKEN" ] || [ -z "$EXPIRY" ]; then
+if [ -z "$ACCESS_TOKEN" ] || [ -z "$EXPIRES_IN" ]; then
   echo "Error: Failed to obtain access token or expiry from OAuth response"
   exit 1
 fi
 
 # --- BUILD EXPIRY STRING IN RCLONE FORMAT ---
-# Calculate expiry in seconds since epoch (now + 3600)
-EXPIRY_EPOCH=`expr \`date +%s\` + 3600`
+# Calculate expiry in seconds since epoch using the REAL lifetime Google
+# returned (expires_in), not a hardcoded value.
+NOW=`date +%s`
+EXPIRY_EPOCH=$(( NOW + EXPIRES_IN ))
 # Format expiry as ISO 8601 with fractional seconds and local timezone
 EXPIRY=`date --date="@$EXPIRY_EPOCH" +"%Y-%m-%dT%H:%M:%S.%N%:z"`
 
@@ -74,10 +74,11 @@ sed -i "/^\[${REMOTE}\]/,/^\[/ s|^token =.*|token = ${NEW_TOKEN}|" "$RCLONE_CONF
   exit 1
 }
 
-# --- TEST CONFIG WITH DRY-RUN ---
-SCRIPT_DIR=`dirname "$0"`
-# Run a dry-run sync to verify the new token works
-if "$SCRIPT_DIR/rclone4gdrive" sync; then
+# --- TEST CONFIG (NON-DESTRUCTIVE) ---
+# Verify the new token works with a dry-run bisync. A dry-run authenticates
+# against Google Drive (proving the token is valid) without writing, deleting,
+# or modifying any files on either side.
+if /usr/bin/rclone bisync gdrive: "$HOME/gdrive" --dry-run --drive-skip-gdocs --create-empty-src-dirs --log-level=ERROR; then
   echo "Dry-run succeeded. Configuration updated."
   rm -f "$RCLONE_CONF.bak"
 else
