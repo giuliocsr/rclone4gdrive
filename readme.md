@@ -42,11 +42,13 @@ rclone4gdrive automates common rclone operations and error handling to give the 
 
 ## Features
 - One-command setup for rclone remote and local sync directory
-- Installs and manages systemd user units for scheduled syncs
+- Installs and manages systemd user units for hourly scheduled syncs
 - Automated detection and handling of rclone failures (token expiry, resync required, etc.)
-- Automatic OAuth token refresh and config update
-- Dry-run and status commands for safe testing and monitoring
+- Automatic OAuth token refresh and config update (verified non-destructively with a dry-run before committing)
+- Status, restart, and manual sync commands for monitoring and control
+- Two-way sync of empty directories (`--create-empty-src-dirs`)
 - Ignores all Google Office Suite files during backup to avoid issues with the Linux filesystem
+- Skips hidden files and directories (e.g. `.git`) when deploying via `init`
 - All scripts are POSIX shell compatible (no Bash required)
 
 ## Installation
@@ -95,12 +97,15 @@ rclone4gdrive automates common rclone operations and error handling to give the 
 
 After installation, you can use the following commands:
 ```sh
-rclone4gdrive status        # Show sync and service status 
-rclone4gdrive restart       # Restart the timer and service 
-rclone4gdrive dry-run       # Test sync without making changes
-rclone4gdrive sync-daemons  # Reinstall and enable systemd units
+rclone4gdrive status        # Show rclone.timer status and the last journal lines of rclone.service
+rclone4gdrive restart       # Restart the timer and start the service immediately
+rclone4gdrive sync          # Run a real two-way rclone bisync now (Google Drive <-> ~/gdrive)
+rclone4gdrive sync-daemons  # (Re)install and enable the systemd user units
 rclone4gdrive init          # (Re)initialize everything
+rclone4gdrive help          # Show this help message
 ```
+
+> **Note:** `sync` performs a *real* two-way synchronization and will propagate changes (including deletions) both ways. The old `dry-run` command was renamed to `sync`; there is no separate dry-run subcommand anymore.
 
 
 ## Directory Structure
