@@ -5,7 +5,7 @@ All contributors will be added and referenced in the `README` file.
 
 ## Project Goals
 
-Please, find under this repository's [issues](https://github.com/thisisnotgcsar/rclone4gdrive/issues) tab all the current needed contributions and TODOs.
+Please, find under this repository's [issues](https://github.com/giuliocsr/rclone4gdrive/issues) tab all the current needed contributions and TODOs.
 
 > If any goal specification is unclear, please state it under the specific issue indicating what is not clear.
 
@@ -24,7 +24,7 @@ Please, find under this repository's [issues](https://github.com/thisisnotgcsar/
    - Go to your forked repository on GitHub.
    - Switch to your feature or bugfix branch.
    - Click the "New pull request" button.
-   - Set the base repository to `thisisnotgcsar/rclone4gdrive` and the base branch to `main`.
+   - Set the base repository to `giuliocsr/rclone4gdrive` and the base branch to `main`.
    - Set the compare branch to your feature or bugfix branch.
    - Add a clear title and detailed description explaining your changes, referencing any related issues if applicable.
    - Review the changes shown, then click "Create pull request".
