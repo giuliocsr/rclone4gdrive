@@ -1,0 +1,7 @@
+# Project-wide shellcheck configuration.
+#
+# These checks are disabled globally because of the sourced-config.sh pattern:
+# variables are ASSIGNED in config.sh and CONSUMED by the scripts that source
+# it, which shellcheck cannot track across the dynamic `. "$SCRIPT_DIR/config.sh"`.
+# All other checks (quoting, globbing, etc.) remain active.
+disable=SC1090,SC1091,SC2034,SC2154

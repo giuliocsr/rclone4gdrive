@@ -1,0 +1,28 @@
+# Lint every shell script with sh -n (syntax) and shellcheck.
+# Runs on pushes to main and on all pull requests.
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: sh -n syntax check
+        run: |
+          for f in rclone4gdrive config.sh refresh_token.sh rclone-fail-handler.sh; do
+            echo "==> sh -n $f"
+            sh -n "$f"
+          done
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: shellcheck
+        # .shellcheckrc at the repo root is picked up automatically.
+        run: shellcheck rclone4gdrive config.sh refresh_token.sh rclone-fail-handler.sh
