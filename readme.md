@@ -6,12 +6,12 @@
 | | | (__| | (_) | | | |  __/\___  | (_| | (_| | |  | |\ V /  __/
 |_|  \___|_|\___/|_| |_|\___|    |_/\__, |\__,_|_|  |_| \_/ \___|
                                      __/ |                       
-                                    |___/                        
+                                    |___|                        
 ```
 
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 [![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/thisisnotgcsar/rclone4gdrive/releases)
-[![Build Status](https://img.shields.io/badge/build-manual-lightgrey.svg)](https://github.com/thisisnotgcsar/rclone4gdrive/actions)
+[![Lint](https://github.com/thisisnotgcsar/rclone4gdrive/actions/workflows/lint.yml/badge.svg)](https://github.com/thisisnotgcsar/rclone4gdrive/actions/workflows/lint.yml)
 
 > Please, help me in leading this project! Look at `CONTRIBUTING.md` for how to contribute.
 > 
@@ -23,9 +23,12 @@ Seamless, automated, and transparent two-way Google Drive backup for Linux.
 
 - [Overview](#overview)
 - [Features](#features)
-- [Installation](#installation)
+- [Quick start](#quick-start)
+- [What you don't need to do](#what-you-dont-need-to-do)
+- [Headless / server install](#headless--server-install)
+- [Advanced init options](#advanced-init-options)
 - [Usage](#usage)
-- [Directory Structure](#directory-structure)
+- [Directory structure](#directory-structure)
 - [How rclone4gdrive works](#how-rclone4gdrive-works)
 - [Customization](#customization)
 - [Contributing](#contributing)
@@ -36,64 +39,82 @@ Seamless, automated, and transparent two-way Google Drive backup for Linux.
 
 rclone4gdrive is a rclone wrapper for Google Drive two-way synchronization. This is typically used for Cloud backup purposes.
 
-Your `~/gdrive/` directory acts as a real-time view of your Google Drive root directory. Any files you add, modify, or delete in `~/gdrive/` are transparently synchronized to Google Drive, and changes made on Google Drive are automatically synced back to your local directory. 
+Your `~/gdrive/` directory acts as a real-time view of your Google Drive root directory. Any files you add, modify, or delete in `~/gdrive/` are transparently synchronized to Google Drive, and changes made on Google Drive are automatically synced back to your local directory.
 
-rclone4gdrive automates common rclone operations and error handling to give the user a "set-up and forget" experience for filesystem-aware cloud backup. It solves a very boring but important issue in the Linux open-source cloud backup space: setting up and automating a seamless and transparent cloud backup of files directly from the Linux filesystem, with minimal manual intervention.
+rclone4gdrive automates common rclone operations and error handling to give the user a "set-up and forget" experience for filesystem-aware cloud backup.
 
 ## Features
-- One-command setup for rclone remote and local sync directory
-- Installs and manages systemd user units for hourly scheduled syncs
-- Automated detection and handling of rclone failures (token expiry, resync required, etc.)
-- Automatic OAuth token refresh and config update (verified non-destructively with a dry-run before committing)
-- Status, restart, and manual sync commands for monitoring and control
-- Two-way sync of empty directories (`--create-empty-src-dirs`)
-- Ignores all Google Office Suite files during backup to avoid issues with the Linux filesystem
-- Skips hidden files and directories (e.g. `.git`) when deploying via `init`
-- All scripts are POSIX shell compatible (no Bash required)
+- **One-command guided setup (`init`)**: checks and installs dependencies, performs Google OAuth, and wires up systemd — no manual `rclone config` or unit editing required
+- Works on **desktops** (automatic browser authorization) and **headless servers** (paste-a-token flow)
+- Uses rclone's shared credentials by default (zero Google Cloud setup), or your own `client_id`/`client_secret` for heavy use
+- Hourly two-way sync via systemd user units, with **automated failure recovery** (token refresh, resync)
+- Non-destructive OAuth token refresh, verified before committing
+- `status`, `restart`, and manual `sync` commands for monitoring and control
+- Ignores Google Docs/Sheets/Slides; syncs empty directories
+- POSIX shell, no Bash required
 
-## Installation
-1. Ensure you have rclone, systemd (user mode), and jq installed:
-	 - **rclone**: The core tool for synchronizing files with Google Drive. rclone4gdrive wraps and automates rclone operations. [Install instructions](https://rclone.org/install/) or run:
-		 ```sh
-		 curl https://rclone.org/install.sh | sudo bash
-		 ```
-	 - **systemd (user mode)**: Used to schedule and manage sync operations automatically. Most modern Linux distributions include systemd. To enable user mode:
-		 ```sh
-		 loginctl enable-linger $USER
-		 # Log out and back in for changes to take effect
-		 ```
-	 - **jq**: Required for parsing and manipulating JSON data. This is used for handling OAuth tokens and updating rclone configuration files.
-		 Install with your package manager, e.g.:
-		 ```sh
-		 sudo apt-get install jq   # Debian/Ubuntu
-		 sudo dnf install jq       # Fedora
-		 sudo pacman -S jq        # Arch
-		 ```
-2. You should also have set up **Google Cloud Console personal OAuth API credentials**. These credentials are required because rclone4gdrive uses them to securely access your Google Drive account via the Google Drive API. Without them, rclone cannot authenticate or perform sync operations on your behalf. If you don't have them set up, here's how to do it:
-	1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
-	2. Create a new project (or select an existing one).
-	3. Navigate to **APIs & Services > Credentials**.
-	4. Click **Create Credentials > OAuth client ID**.
-	5. If prompted, configure the consent screen (fill in required fields).
-	6. Choose **Desktop app** as the application type.
-	7. Name your client and click **Create**.
-	8. Download the credentials JSON file, or copy the **Client ID** and **Client Secret**.
-	9. When configuring rclone, use these credentials for your Google Drive remote (you can specify them during initialization).
-3. Clone this repository to your system.
-4. Run the initialization command:
-	```sh
-	./rclone4gdrive init
-	```
-	This will:
-   - Copy this repository directory to `~/bin/rclone4gdrive`
-   - Add `~/bin/rclone4gdrive` to your PATH (via `~/.bashrc`)
-   - Set up the rclone remote (named `gdrive`)
-   - Install and enable the systemd user units for scheduled sync and failure handling
+## Quick start
 
-	Once installation is complete, rclone4gdrive will start its execution and begin backing up and downloading files from Google Drive into your `$HOME/gdrive/` directory.
+```sh
+git clone https://github.com/thisisnotgcsar/rclone4gdrive
+cd rclone4gdrive
+./rclone4gdrive init
+```
+
+That's the whole setup. `init` walks you through everything:
+
+1. **Dependencies.** If `rclone`, `jq`, or user lingering is missing, `init` offers to install/enable them with `sudo`. Approve the prompts (or install them yourself beforehand).
+2. **Google credentials.** By default it uses rclone's shared credentials — just press Enter. (Use your own only if you hit rate limits; see [Advanced init options](#advanced-init-options).)
+3. **Authorize once.** A browser opens; sign in to Google and click **Allow**. This is the *only* manual step, and it happens exactly once.
+
+When `init` finishes, `~/gdrive/` mirrors your Google Drive and stays in sync every hour. Run `rclone4gdrive status` to confirm.
+
+> The one browser "Allow" click is unavoidable — Google requires a human to consent to Drive access for a personal account. After that single click, everything (including renewing the token forever after) is automatic.
+
+## What you don't need to do
+
+- ❌ You do **not** need to create Google Cloud Console credentials. rclone's shared credentials are used by default. (Bring your own only if you want to avoid shared rate limits.)
+- ❌ You do **not** need to run `rclone config` yourself — `init` creates and authorizes the remote for you.
+- ❌ You do **not** need to write or enable systemd unit files by hand — `init` installs and enables them.
+- ❌ You do **not** need root for the app itself — everything runs under your user. (`init` only asks for `sudo` to install `rclone`/`jq` and enable lingering, which you can do yourself instead.)
+
+## Headless / server install
+
+On a machine with no browser, add `--headless`:
+
+```sh
+./rclone4gdrive init --headless
+```
+
+`init` still handles dependencies and systemd, but for authorization it prints a command for you to run on **any computer that has a browser and rclone**:
+
+```sh
+rclone authorize "drive"
+```
+
+(If you use your own credentials, it will be `rclone authorize "drive" "YOUR_ID" "YOUR_SECRET"` instead.) A browser opens there; after you click **Allow**, rclone prints a single JSON line starting with `{"access_token" ...`. Copy that **entire** line, paste it at `init`'s prompt, and press Enter. The token is stored and you're done.
+
+## Advanced init options
+
+```sh
+rclone4gdrive init --help
+```
+
+| Option | What it does |
+|---|---|
+| `--bundled` | Use rclone's shared Google credentials (the default) |
+| `--client-id ID`<br>`--client-secret SECRET` | Use your own Google OAuth credentials (best for heavy use; both required) |
+| `--headless` | Force the paste-a-token authorization flow (servers with no browser) |
+| `--no-deps-install` | Check dependencies but do not attempt to install them or enable linger |
+
+Example — fully non-interactive setup with your own credentials on a desktop:
+
+```sh
+rclone4gdrive init --client-id 1234-abc.apps.googleusercontent.com --client-secret GOCSPX-xxxx
+```
 
 ## Usage
-> Your `~/gdrive/` directory is effectively a real-time view of your Google Drive root directory. Everything inserted, modified, or deleted within `~/gdrive/` will be transparently synchronized to your configured Google Drive location. This works both ways—changes made on Google Drive will also sync back to your local `~/gdrive/` directory.
+> Your `~/gdrive/` directory is effectively a real-time view of your Google Drive root directory. Everything inserted, modified, or deleted within `~/gdrive/` will be transparently synchronized to your configured Google Drive location. This works both ways — changes made on Google Drive will also sync back to your local `~/gdrive/` directory.
 
 After installation, you can use the following commands:
 ```sh
@@ -101,38 +122,49 @@ rclone4gdrive status        # Show rclone.timer status and the last journal line
 rclone4gdrive restart       # Restart the timer and start the service immediately
 rclone4gdrive sync          # Run a real two-way rclone bisync now (Google Drive <-> ~/gdrive)
 rclone4gdrive sync-daemons  # (Re)install and enable the systemd user units
-rclone4gdrive init          # (Re)initialize everything
+rclone4gdrive init          # (Re)run guided setup
+rclone4gdrive uninstall     # Remove everything rclone4gdrive installed (units, scripts, the gdrive remote, ~/gdrive)
 rclone4gdrive help          # Show this help message
 ```
 
 > **Note:** `sync` performs a *real* two-way synchronization and will propagate changes (including deletions) both ways. The old `dry-run` command was renamed to `sync`; there is no separate dry-run subcommand anymore.
 
+> **Upgrading from an earlier version:** the `rclone.service` unit now runs the bisync through an internal command instead of calling rclone directly, and `init` is now guided. If you already had rclone4gdrive installed, just run `rclone4gdrive init` once after updating (it will skip the parts that are already done).
 
-## Directory Structure
-- `rclone4gdrive`           : Main script/entrypoint
-- `refresh_token.sh`        : Script to refresh OAuth token and update `rclone.conf`
+## Directory structure
+- `rclone4gdrive`           : Main script / entrypoint (contains the guided `init`)
+- `config.sh`               : Shared configuration (remote name, sync dir, rclone paths, common bisync flags) sourced by every script
+- `refresh_token.sh`        : Refreshes the OAuth token and updates `rclone.conf`
 - `rclone-fail-handler.sh`  : Handles sync failures and triggers recovery
 - `daemons/`                : systemd user unit files
-	- `rclone.service`         : Runs the rclone bisync operation
-	- `rclone.timer`           : Schedules regular syncs
+	- `rclone.service`         : Runs the bisync via an internal helper command
+	- `rclone.timer`           : Schedules regular syncs (hourly)
 	- `rclone-fail.service`    : Handles failures and triggers recovery actions
 
 ## How rclone4gdrive works
 
-The rclone4gdrive system automates two-way synchronization between your local `$HOME/gdrive/` directory and Google Drive, using rclone and systemd for reliability and hands-off operation.
+*This section is for the curious. You don't need any of it to use the tool.*
 
-At its core, rclone4gdrive leverages systemd user services and timers to schedule and execute **rclone bisync operations** at regular intervals. This oepration which performa safe, two-way synchronization—detecting changes, additions, and deletions on both sides and propagating them so that your local and Google Drive folders always match. 
+**The moving parts.** rclone4gdrive is a thin orchestrator around four things: `rclone bisync` (the actual two-way sync), a systemd **timer** that fires hourly, a systemd **service** that runs the bisync, and a **failure handler** that recovers from problems. Three small shell scripts wire them together, and `config.sh` holds the single shared definition of the remote name, local directory, rclone binary, and the common bisync flags.
 
-The **timer service** triggers the **sync service**, which runs rclone in bisync mode to ensure both local and remote directories are kept in sync. All operations are atomic and logged to the systemd journal for monitoring.
+**Setup, in detail (`init`).**
+1. *Dependencies.* `init` checks for `rclone`, `jq`, and user lingering (so timers run even when you're logged out). For anything missing it offers to install/enable it with `sudo`, falling back to exact copy-paste instructions.
+2. *Credentials.* Google Drive access requires an OAuth *client*. By default `init` uses rclone's own registered client (the "shared" credentials) so you never touch the Google Cloud Console. You can instead pass your own `client_id`/`client_secret` for a private rate-limit budget. Either way, the client identifies the *application* — it never shares your files or storage with anyone; access to your data is granted only by your personal authorization token.
+3. *Authorization.* This is the one step a human must perform, because Google requires explicit consent for Drive access on a personal account. On a desktop, `init` runs `rclone config reconnect`, which opens a browser, runs a localhost callback, and writes the token into `rclone.conf` automatically — you just click **Allow**. On a headless server, `init` instead uses the `rclone authorize` paste-a-token flow (see [Headless / server install](#headless--server-install)). If `init` detects the remote is already authorized, it skips this entirely, so re-running `init` is safe and idempotent.
+4. *Verify.* `init` runs `rclone about gdrive:` to confirm the token actually works before declaring success.
+5. *Deploy.* Finally it copies the scripts to `~/bin/rclone4gdrive/`, adds that directory to your `PATH` via `~/.bashrc`, installs the systemd units, and starts the timer.
 
-Robust error handling is built in: if a sync fails (e.g., due to an expired OAuth token or a required resync), a dedicated failure handler is triggered: `rclone-fail-handler.sh`. This handler inspects recent logs, detects known error patterns, and attempts automated recovery steps such as refreshing the OAuth token or running a resync. If recovery succeeds, the timer and service are restarted automatically; otherwise, the user is notified for manual intervention.
+**Token lifecycle.** The one-time consent produces a refresh token stored in `rclone.conf`. Access tokens expire after about an hour; when they do, `refresh_token.sh` uses the refresh token to get a new one, updates `rclone.conf` (with backup + rollback, verified by a non-destructive dry-run). So after that single click, renewal is fully automatic forever.
 
-OAuth token management is fully automated. The refresh script (`refresh_token.sh`) extracts credentials from your rclone configuration, requests a new access token from Google, and updates the config file safely, with backup and rollback in case of errors. Token validity is verified by running a dry-run sync before finalizing changes.
+**The hourly sync.** `rclone.timer` fires `rclone.service`, which runs the bisync. Rather than duplicate the bisync flags inside the unit (which can drift out of sync with the scripts), the unit delegates to an internal command — `rclone4gdrive sync-service` — that sources `config.sh`. That command is deliberately omitted from `rclone4gdrive help` and you never run it yourself; it's plumbing. The unit is `Type=oneshot`, so any non-zero exit is treated as failure, which is what triggers recovery.
 
-All scripts are written in Shell for portability. JSON parsing and manipulation are handled with jq. The system is designed to ignore Google Docs files during backup, preventing issues with the Linux filesystem. All configuration and logs are stored in user directories, requiring no root access and keeping your environment clean and secure.
+**Failure recovery.** If a sync fails, `OnFailure=rclone-fail.service` runs `rclone-fail-handler.sh`. It inspects the last journal lines for known error patterns and acts: an expired/revoked token triggers `refresh_token.sh`; a "must run --resync" condition (including the very first sync of a new pair) triggers a `--resync`. If recovery succeeds, it restarts the timer; otherwise it leaves the timer stopped and asks for manual intervention. (The first sync after a fresh setup typically needs that one-time `--resync`, which the handler performs automatically.)
+
+**Single source of truth.** Every bisync invocation — the timer, manual `sync`, failure-recovery resync, and the token-check dry-run — reads `REMOTE`, `SYNC_DIR`, `RCLONE_BIN`, and `BISYNC_COMMON_FLAGS` from `config.sh`. Change one line there and all of them update together; there are no duplicated flags to keep in agreement.
 
 ## Customization
-- Edit the systemd unit files in `daemons/` to change sync frequency or behavior
+- Edit `config.sh` to change the rclone remote name, the local sync directory (`~/gdrive` by default), or the common bisync flags applied to every sync
+- Edit the systemd unit files in `daemons/` to change sync frequency or behavior (then run `rclone4gdrive sync-daemons`)
 
 ## Contributing
 Pull requests and issues are welcome! Please, help me in leading this project! Look at CONTRIBUTING.md for how to contribute.
