@@ -5,9 +5,12 @@ OnFailure=rclone-fail.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/rclone bisync gdrive: %h/gdrive/ --drive-skip-gdocs --create-empty-src-dirs --log-level=ERROR
-# For Type=oneshot any non-zero exit is already treated as failure, which
-# triggers OnFailure=rclone-fail.service above.
+# Run the bisync through the helper script instead of calling rclone directly,
+# so the bisync flags live in one place (config.sh, sourced by the script)
+# rather than being duplicated in this unit. sync-service exits with rclone's
+# status, so any non-zero exit is treated as failure and triggers
+# OnFailure=rclone-fail.service above.
+ExecStart=%h/bin/rclone4gdrive/rclone4gdrive sync-service
 StandardOutput=journal
 StandardError=journal
 

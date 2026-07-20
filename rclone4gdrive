@@ -2,11 +2,32 @@
 
 # rclone4gdrive
 # Purpose: Manage rclone timer/service operations for Google Drive synchronization.
-# Features:
-#   - Provides status and restart commands for rclone systemd units.
-#   - Supports sync (actual bisync) operations.
-#   - Installs and enables systemd user units from the daemons/ directory.
-#   - 'init' command sets up gdrive remote, ensures $HOME/gdrive exists, and copies the script directory for system-wide or user use.
+#
+# User-facing commands: status, restart, sync, sync-daemons, init, help.
+# Internal command (used by the systemd unit, not shown in help): sync-service.
+#
+# `init` performs a guided, near-autonomous setup:
+#   1. checks/installs OS dependencies (rclone, jq, user lingering),
+#   2. performs Google OAuth (browser on desktops, paste-a-token on headless),
+#   3. verifies the connection, then
+#   4. deploys the scripts and systemd units and starts syncing.
+# Run `init --help` for options.
+#
+# Shared configuration (REMOTE, SYNC_DIR, RCLONE_BIN, RCLONE_CONF,
+# BISYNC_COMMON_FLAGS) is sourced from config.sh so it stays in lockstep with
+# refresh_token.sh and rclone-fail-handler.sh.
+
+# Resolve this script's directory even when invoked via PATH, then load config.
+case "$0" in
+  */*) _self=$0 ;;                                  # already a path
+  *)                                                # bare name -> look up via PATH
+    _self=$(command -v "$0")
+    [ -n "$_self" ] || _self="./$0"
+    ;;
+esac
+SCRIPT_DIR=$(unset CDPATH; cd "$(dirname -- "$_self")" && pwd)
+# shellcheck disable=SC1090  # dynamic path; config.sh ships next to this script
+. "$SCRIPT_DIR/config.sh"
 
 show_help() {
   cat <<EOF
@@ -14,27 +35,130 @@ Usage: $0 <command>
 
 Commands:
   status         Show a compact summary of rclone.timer and the last 10 lines of the rclone.service journal
-  restart        Restart rclone.timer and show the updated status
+  restart        Restart rclone.timer and start rclone.service immediately
   sync           Run rclone bisync to synchronize your Google Drive and local directory
   sync-daemons   Install service/timer unit files from daemons/ into ~/.config/systemd/user, reload and enable/start them
-  init           Initialize gdrive remote, ensure \$HOME/gdrive exists, and copy the script directory for deployment
+  init           Guided setup: dependencies, Google OAuth, validation, deploy + systemd units (run 'init --help' for options)
+  uninstall      Remove everything rclone4gdrive installed: units, scripts, PATH entry, the gdrive remote (backed up), and ~/gdrive
   help, -h, --help  Show this help message
 EOF
 }
 
-# --- Utility functions ---
+# --- Status / control ---
+
+# Render a systemd wall-clock timestamp as a short relative phrase
+# ("22 min ago", "in 38 min"). Falls back to the raw timestamp if date(1)
+# can't parse it.
+rel_time() {
+  _ts=$1
+  [ -n "$_ts" ] || return
+  _then=$(date -d "$_ts" +%s 2>/dev/null)
+  if [ -z "$_then" ]; then printf '%s\n' "$_ts"; return; fi
+  _now=$(date +%s)
+  _diff=$(( _now - _then ))   # >0 = past, <0 = future
+  _abs=$_diff
+  [ "$_abs" -lt 0 ] && _abs=$(( -_abs ))
+  if [ "$_abs" -lt 60 ]; then _pretty="$_abs s"
+  elif [ "$_abs" -lt 3600 ]; then _pretty="$(( _abs / 60 )) min"
+  else _pretty="$(( _abs / 3600 )) h"
+  fi
+  if [ "$_diff" -ge 0 ]; then echo "$_pretty ago"; else echo "in $_pretty"; fi
+}
+
+# Run a command with a hard wall-clock cap if the `timeout` command is present.
+# Used so `status` can never hang on a slow network call (e.g. `rclone about`).
+timed_run() {
+  _secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_secs" "$@"
+  else
+    "$@"
+  fi
+}
 
 status_cmd() {
-  echo "== rclone.timer (compact) =="
-  systemctl --user status rclone.timer ||
-    echo "Timer unit rclone.timer not found or systemctl unavailable."
-
+  OK="${STATUS_OK:-✓}"; BAD="${STATUS_BAD:-✗}"
+  echo "rclone4gdrive status"
   echo
-  echo "== rclone.service (last 10 lines) =="
-  # Show only last 10 journal lines for quick inspection
-  journalctl --user -u rclone.service -n 10 --no-pager 2>/dev/null || {
-    echo "No journal entries found for rclone.service or journalctl unavailable."
-  }
+
+  # Each signal is printed as soon as it is gathered, so a slow Auth check can
+  # never hide the (instant) Timer and Last-sync lines.
+
+  # ---- Timer ----
+  not_installed=0
+  if systemctl --user list-unit-files --no-pager --no-legend 2>/dev/null | grep -q '^rclone\.timer'; then
+    timer_active=$(systemctl --user is-active rclone.timer 2>/dev/null)
+    timer_enabled=$(systemctl --user is-enabled rclone.timer 2>/dev/null)
+    next_elapse=$(systemctl --user show rclone.timer -p NextElapseUSecRealtime --value 2>/dev/null)
+    [ "$next_elapse" = "n/a" ] && next_elapse=
+    next_rel=
+    [ -n "$next_elapse" ] && next_rel=$(rel_time "$next_elapse")
+    if [ "$timer_active" = active ]; then
+      timer_sym=$OK; timer_ok=1
+      timer_detail="active"
+      [ "$timer_enabled" = enabled ] || timer_detail="$timer_detail (not enabled at boot)"
+      [ -n "$next_rel" ] && timer_detail="$timer_detail; next sync $next_rel"
+    else
+      timer_sym=$BAD; timer_ok=0
+      timer_detail="inactive (not scheduled)"
+    fi
+  else
+    timer_sym=$BAD; timer_ok=0; timer_detail="not installed"; not_installed=1
+  fi
+  printf '  %-10s %s  %s\n' "Timer" "$timer_sym" "$timer_detail"
+
+  # ---- Last sync ----
+  if [ "$not_installed" = 1 ]; then
+    sync_sym=$BAD; sync_ok=0; sync_detail="not installed"
+  else
+    sync_result=$(systemctl --user show rclone.service -p Result --value 2>/dev/null)
+    sync_exit=$(systemctl --user show rclone.service -p ExecMainStatus --value 2>/dev/null)
+    sync_when=$(systemctl --user show rclone.service -p InactiveEnterTimestamp --value 2>/dev/null)
+    when_rel=
+    [ -n "$sync_when" ] && when_rel=$(rel_time "$sync_when")
+    case "$sync_result" in
+      success)
+        sync_sym=$OK; sync_ok=1
+        sync_detail="succeeded${when_rel:+ $when_rel}" ;;
+      ""|inactive)
+        sync_sym=$OK; sync_ok=1
+        sync_detail="not run yet (waiting for first scheduled sync)" ;;
+      *)
+        sync_sym=$BAD; sync_ok=0
+        sync_detail="FAILED${sync_exit:+ (rclone exit $sync_exit)}${when_rel:+ $when_rel}; recovery runs automatically" ;;
+    esac
+  fi
+  printf '  %-10s %s  %s\n' "Last sync" "$sync_sym" "$sync_detail"
+
+  # ---- Auth ---- (bounded network call; cannot hang status)
+  if remote_has_token; then
+    if timed_run 8 "$RCLONE_BIN" about "${REMOTE}:" >/dev/null 2>&1; then
+      auth_sym=$OK; auth_ok=1; auth_detail="token works (reached Google Drive)"
+    else
+      auth_sym=$BAD; auth_ok=0; auth_detail="token present but Drive unreachable (expired, offline, or timed out)"
+    fi
+  else
+    auth_sym=$BAD; auth_ok=0; auth_detail="no token (not authorized)"
+  fi
+  printf '  %-10s %s  %s\n' "Auth" "$auth_sym" "$auth_detail"
+
+  # ---- Verdict ----
+  echo "  ───────────────────────────────────────"
+  if [ "$not_installed" = 1 ]; then
+    v_sym=$BAD; v_text="Not installed."; fix="Run: rclone4gdrive init"
+  elif [ "$timer_ok" != 1 ]; then
+    v_sym=$BAD; v_text="Timer is not running."; fix="Run: rclone4gdrive restart"
+  elif [ "$auth_ok" != 1 ]; then
+    v_sym=$BAD; v_text="Authorization problem."; fix="Run: rclone4gdrive init"
+  elif [ "$sync_ok" != 1 ]; then
+    v_sym=$BAD; v_text="Last sync failed; auto-recovery should handle it."; fix="Check again shortly, or: journalctl --user -u rclone.service"
+  else
+    v_sym=$OK; v_text="All good — syncing hourly."; fix=
+  fi
+  printf '  %-10s %s  %s\n' "Verdict" "$v_sym" "$v_text"
+  [ -n "$fix" ] && printf '                %s\n' "$fix"
+  echo
+  echo "  Full logs: journalctl --user -u rclone.service"
 }
 
 restart_cmd() {
@@ -52,13 +176,23 @@ restart_cmd() {
   fi
 }
 
+# Manual two-way sync with progress and INFO logging for interactive use.
 sync_cmd() {
   echo "Running rclone bisync (actual sync)..."
-  /usr/bin/rclone bisync gdrive: "$HOME/gdrive" --drive-skip-gdocs --create-empty-src-dirs --progress --log-level=INFO
+  # shellcheck disable=SC2086  # intentional word-splitting of BISYNC_COMMON_FLAGS
+  "$RCLONE_BIN" bisync "${REMOTE}:" "$SYNC_DIR" $BISYNC_COMMON_FLAGS --progress --log-level=INFO
+}
+
+# Internal sync used by rclone.service. ERROR logging and no --progress, which
+# is what the systemd journal wants. Exit status is rclone's, so OnFailure
+# still triggers correctly. Keeps the bisync flags in config.sh instead of
+# duplicating them in the systemd unit.
+sync_service_cmd() {
+  # shellcheck disable=SC2086  # intentional word-splitting of BISYNC_COMMON_FLAGS
+  "$RCLONE_BIN" bisync "${REMOTE}:" "$SYNC_DIR"/ $BISYNC_COMMON_FLAGS --log-level=ERROR
 }
 
 sync_daemons_cmd() {
-  SCRIPT_DIR=`dirname "$0"`
   DAEMONS_DIR="$SCRIPT_DIR/daemons"
   TARGET_DIR="$HOME/.config/systemd/user"
 
@@ -67,24 +201,24 @@ sync_daemons_cmd() {
     return 1
   fi
 
-  mkdir -p "$TARGET_DIR"
-
-  # Find .service and .timer files
-  units=""
+  # Bail out early if there is nothing to install.
+  has_units=false
   for f in "$DAEMONS_DIR"/*.service "$DAEMONS_DIR"/*.timer; do
-    [ -e "$f" ] && units="$units $f"
+    [ -e "$f" ] && has_units=true
   done
-
-  if [ -z "$units" ]; then
+  if [ "$has_units" = false ]; then
     echo "No .service or .timer files found in $DAEMONS_DIR"
     return 1
   fi
 
+  mkdir -p "$TARGET_DIR"
+
+  # Iterate the glob directly so each filename stays a single, safely-quoted
+  # argument (no space-separated string, no word-splitting).
   echo "Copying unit(s) to $TARGET_DIR..."
-  for f in $units; do
-    cp -a "$f" "$TARGET_DIR/" || {
-      echo "Failed to copy: $f"
-    }
+  for f in "$DAEMONS_DIR"/*.service "$DAEMONS_DIR"/*.timer; do
+    [ -e "$f" ] || continue
+    cp -a "$f" "$TARGET_DIR/" || echo "Failed to copy: $f"
   done
 
   echo "Reloading user systemd daemon..."
@@ -93,8 +227,9 @@ sync_daemons_cmd() {
   }
 
   echo "Enabling and starting timer units only..."
-  for f in $units; do
-    unit=`basename "$f"`
+  for f in "$DAEMONS_DIR"/*.service "$DAEMONS_DIR"/*.timer; do
+    [ -e "$f" ] || continue
+    unit=$(basename -- "$f")
     case "$unit" in
       *.timer)
         systemctl --user enable --now "$unit" 2>/dev/null && \
@@ -105,39 +240,444 @@ sync_daemons_cmd() {
   done
 }
 
-init_cmd() {
-  if [ -d "$HOME/gdrive" ] && rclone listremotes | grep -q '^gdrive:'; then
-    echo "$HOME/gdrive exists and 'gdrive' remote found in rclone. Skipping rclone initialization."
+# ===========================================================================
+# init: guided setup (dependencies, OAuth, validation, deploy)
+# ===========================================================================
+
+init_help() {
+  cat <<EOF
+Usage: $0 init [options]
+
+Perform a guided setup. By default this uses rclone's shared Google credentials
+and opens a browser for the one-time OAuth consent.
+
+Options:
+  --bundled              Use rclone's default (shared) Google credentials
+  --client-id ID         Use your own Google OAuth client_id  (requires --client-secret)
+  --client-secret SECRET Use your own Google OAuth client_secret (requires --client-id)
+  --headless             Force the paste-a-token flow (for servers with no browser)
+  --no-deps-install      Do not attempt to install rclone/jq or enable linger; just check
+  -h, --help             Show this help
+EOF
+}
+
+# Ask a yes/no question. $1=prompt, $2=default (y or n). Returns 0 for yes.
+ask_yn() {
+  if [ "$2" = y ]; then _opts="Y/n"; else _opts="y/N"; fi
+  printf '%s [%s] ' "$1" "$_opts"
+  read -r _ans || _ans=''
+  case "$_ans" in
+    y|Y|yes|YES) return 0 ;;
+    n|N|no|NO) return 1 ;;
+  esac
+  [ "$2" = y ]
+}
+
+# Echo the system package manager, or nothing.
+detect_pkg_mgr() {
+  command -v apt-get >/dev/null 2>&1 && { echo apt-get; return; }
+  command -v dnf     >/dev/null 2>&1 && { echo dnf; return; }
+  command -v pacman  >/dev/null 2>&1 && { echo pacman; return; }
+  command -v zypper  >/dev/null 2>&1 && { echo zypper; return; }
+}
+
+ensure_rclone() {
+  if ! command -v rclone >/dev/null 2>&1; then
+    echo "  rclone was not found."
+    if [ "$INIT_INSTALL_DEPS" != no ] && ask_yn "  Install rclone via the official installer (needs sudo)?" y; then
+      curl https://rclone.org/install.sh | sudo bash || { echo "  rclone install failed."; return 1; }
+    else
+      echo "  Install rclone yourself:  curl https://rclone.org/install.sh | sudo bash"
+      echo "  then re-run: $0 init"
+      return 1
+    fi
+  fi
+  # rclone exists; make sure config.sh's RCLONE_BIN path is actually usable.
+  if ! "$RCLONE_BIN" --version >/dev/null 2>&1; then
+    found=$(command -v rclone)
+    echo "  Note: rclone is at '$found' but the scripts expect '$RCLONE_BIN'."
+    if [ "$INIT_INSTALL_DEPS" != no ] && ask_yn "  Symlink $found -> $RCLONE_BIN (needs sudo)?" y; then
+      sudo ln -sf "$found" "$RCLONE_BIN" || { echo "  Symlink failed. Set RCLONE_BIN=$found in config.sh."; return 1; }
+    else
+      echo "  Symlink it, or set RCLONE_BIN=$found in config.sh, then re-run."
+      return 1
+    fi
+  fi
+  return 0
+}
+
+ensure_jq() {
+  command -v jq >/dev/null 2>&1 && return 0
+  echo "  jq was not found (needed to refresh OAuth tokens)."
+  if [ "$INIT_INSTALL_DEPS" = no ]; then
+    echo "  Install jq with your package manager, then re-run: $0 init"
+    return 1
+  fi
+  pm=$(detect_pkg_mgr)
+  if [ -z "$pm" ]; then
+    echo "  Could not detect a package manager. Install jq yourself, then re-run."
+    return 1
+  fi
+  case "$pm" in
+    apt-get) cmd="sudo apt-get update && sudo apt-get install -y jq" ;;
+    dnf)     cmd="sudo dnf install -y jq" ;;
+    pacman)  cmd="sudo pacman -S --noconfirm jq" ;;
+    zypper)  cmd="sudo zypper install -y jq" ;;
+  esac
+  if ask_yn "  Install jq via '$pm' (needs sudo)?" y; then
+    sh -c "$cmd" || { echo "  jq install failed."; return 1; }
   else
-    echo "Initializing gdrive rclone instance under $HOME/gdrive..."
-    mkdir -p "$HOME/gdrive"
-    rclone config create gdrive drive || { echo "rclone config failed. Aborting init."; exit 1; }
+    echo "  Install jq yourself ($cmd), then re-run."
+    return 1
+  fi
+}
+
+ensure_linger() {
+  _user="${USER:-$(id -un)}"
+  if loginctl show-user "$_user" --property=Linger 2>/dev/null | grep -q '^Linger=yes'; then
+    return 0
+  fi
+  # Background scheduling must be on so syncs run across logouts and reboots.
+  # It is enabled automatically (needs sudo); the only thing the user sees is
+  # sudo's password prompt -- no explanation, no yes/no choice.
+  if [ "$INIT_INSTALL_DEPS" = no ]; then
+    echo "  Background scheduling is off. Enable it with: sudo loginctl enable-linger $_user" >&2
+    return 1
+  fi
+  echo "  Enabling background scheduling (your sudo password may be requested)..."
+  sudo loginctl enable-linger "$_user" || {
+    echo "  Failed to enable background scheduling. Run manually: sudo loginctl enable-linger $_user" >&2
+    return 1
+  }
+}
+
+# Does the rclone remote already exist?
+remote_exists() {
+  "$RCLONE_BIN" listremotes 2>/dev/null | grep -q "^${REMOTE}:"
+}
+
+# Does the rclone remote already have a (non-empty) OAuth token stored?
+remote_has_token() {
+  [ -n "$RCLONE_CONF" ] && [ -f "$RCLONE_CONF" ] || return 1
+  awk -v remote="$REMOTE" '
+    /^\[/ { insec = ($0 == "[" remote "]") }
+    insec && /^token[[:space:]]*=[[:space:]]*\{/ { found = 1 }
+    END { exit !found }
+  ' "$RCLONE_CONF"
+}
+
+# Should we use the headless (paste-a-token) flow?
+is_headless() {
+  [ "$INIT_HEADLESS" = 1 ] && return 0
+  [ -z "${DISPLAY}${WAYLAND_DISPLAY}" ] && return 0
+  command -v xdg-open >/dev/null 2>&1 || return 0
+  return 1
+}
+
+# Headless authorization: run `rclone authorize` elsewhere, paste the token back.
+oauth_headless() {
+  echo
+  echo "  Headless authorization (paste-a-token)."
+  echo "  On ANY computer that has a web browser and rclone installed, run:"
+  echo
+  if [ "$INIT_CREDS_MODE" = custom ]; then
+    printf '      rclone authorize "drive" "%s" "%s"\n' "$INIT_CLIENT_ID" "$INIT_CLIENT_SECRET"
+    echo
+    echo "  (it MUST use the same client_id/secret configured here)"
+  else
+    echo '      rclone authorize "drive"'
+    echo
+    echo "  (uses rclone's shared credentials, matching this setup)"
+  fi
+  echo
+  echo "  A browser opens; after you click \"Allow\", rclone prints a single JSON line"
+  echo "  starting with {\"access_token\" ... }. Copy that ENTIRE line."
+  echo
+  printf '  Paste the token JSON here, then press Enter: '
+  read -r TOKEN_JSON
+  if [ -z "$TOKEN_JSON" ]; then
+    echo "  No token pasted."
+    return 1
+  fi
+  if "$RCLONE_BIN" config update "$REMOTE" token "$TOKEN_JSON"; then
+    echo "  Token stored."
+    return 0
+  fi
+  echo "  Failed to store the token."
+  return 1
+}
+
+# Create the remote and perform Google OAuth. Exactly ONE authorization happens.
+# Desktop: `rclone config create` itself opens the browser and stores the token
+#   (or `config reconnect` if the remote already exists but lacks a token).
+# Headless: create with config_is_local=false (no local browser), then paste a
+#   token produced by `rclone authorize` run elsewhere.
+do_oauth() {
+  if remote_exists && remote_has_token; then
+    return 0
   fi
 
-  SCRIPT_DIR=`dirname "$0"`
-  # Deploy into ~/bin/rclone4gdrive/ as a DIRECTORY. The systemd unit
-  # rclone-fail.service runs %h/bin/rclone4gdrive/rclone-fail-handler.sh and the
-  # PATH entry below adds $HOME/bin/rclone4gdrive, so both require this to be a
-  # directory, not a flat copy into ~/bin/. The trailing '/*' skips hidden items
-  # such as .git and .gitignore.
+  if is_headless; then
+    if ! remote_exists; then
+      echo "  Creating '$REMOTE' remote (headless - no browser)..."
+      if [ "$INIT_CREDS_MODE" = custom ]; then
+        "$RCLONE_BIN" config create "$REMOTE" drive config_is_local=false \
+          client_id "$INIT_CLIENT_ID" client_secret "$INIT_CLIENT_SECRET" </dev/null
+      else
+        "$RCLONE_BIN" config create "$REMOTE" drive config_is_local=false </dev/null
+      fi
+    fi
+    oauth_headless
+  else
+    echo "  Opening your browser to authorize with Google..."
+    echo "  (Sign in and click \"Allow\". This is the only manual step.)"
+    if remote_exists; then
+      "$RCLONE_BIN" config reconnect "$REMOTE":
+    else
+      if [ "$INIT_CREDS_MODE" = custom ]; then
+        "$RCLONE_BIN" config create "$REMOTE" drive \
+          client_id "$INIT_CLIENT_ID" client_secret "$INIT_CLIENT_SECRET"
+      else
+        "$RCLONE_BIN" config create "$REMOTE" drive
+      fi
+    fi
+  fi
+}
+
+# Deploy scripts to ~/bin/rclone4gdrive/ and add the PATH entry to ~/.bashrc.
+deploy_scripts() {
   TARGET_BIN="$HOME/bin/rclone4gdrive"
   if [ -e "$TARGET_BIN" ] && [ ! -d "$TARGET_BIN" ]; then
-    echo "Removing stale non-directory at $TARGET_BIN (left over from a previous init)..."
+    echo "  Removing stale non-directory at $TARGET_BIN (left over from an older init)..."
     rm -f "$TARGET_BIN"
   fi
   mkdir -p "$TARGET_BIN"
-  echo "Copying $SCRIPT_DIR to $TARGET_BIN ..."
+  echo "  Deploying scripts to $TARGET_BIN ..."
   cp -a "$SCRIPT_DIR"/* "$TARGET_BIN"/
+  # Never ship credential files: credentials live in rclone.conf, not the repo.
+  rm -f "$TARGET_BIN"/gdrive_api_secrets.json
 
   BASHRC="$HOME/.bashrc"
+  # shellcheck disable=SC2016  # literal: $HOME/$PATH must expand when ~/.bashrc runs, not here
   PATH_LINE='export PATH="$HOME/bin/rclone4gdrive:$PATH"'
-  grep -Fxq "$PATH_LINE" "$BASHRC" || {
+  if grep -Fxq "$PATH_LINE" "$BASHRC" 2>/dev/null; then
+    :
+  else
     echo "$PATH_LINE" >> "$BASHRC"
-    echo "Added $PATH_LINE to $BASHRC. Run: source $BASHRC to update your PATH."
-  }
+    echo "  Added $PATH_LINE to $BASHRC (run: source $BASHRC)."
+  fi
+}
 
-  sync_daemons_cmd
-  restart_cmd
+init_cmd() {
+  INIT_CLIENT_ID=""
+  INIT_CLIENT_SECRET=""
+  INIT_HEADLESS=""
+  INIT_INSTALL_DEPS=ask
+  INIT_CREDS_MODE=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --bundled) INIT_CREDS_MODE=bundled; shift ;;
+      --client-id)
+        [ $# -ge 2 ] || { echo "init: --client-id requires a value" >&2; return 1; }
+        INIT_CLIENT_ID=$2; shift 2 ;;
+      --client-id=*) INIT_CLIENT_ID=${1#*=}; shift ;;
+      --client-secret)
+        [ $# -ge 2 ] || { echo "init: --client-secret requires a value" >&2; return 1; }
+        INIT_CLIENT_SECRET=$2; shift 2 ;;
+      --client-secret=*) INIT_CLIENT_SECRET=${1#*=}; shift ;;
+      --headless) INIT_HEADLESS=1; shift ;;
+      --no-deps-install|--skip-deps) INIT_INSTALL_DEPS=no; shift ;;
+      -h|--help) init_help; return 0 ;;
+      *) echo "init: unknown option: $1" >&2; init_help; return 1 ;;
+    esac
+  done
+
+  # Credentials sanity: id and secret must come together.
+  if [ -n "$INIT_CLIENT_ID" ] && [ -n "$INIT_CLIENT_SECRET" ]; then
+    INIT_CREDS_MODE=custom
+  elif [ -n "$INIT_CLIENT_ID" ] || [ -n "$INIT_CLIENT_SECRET" ]; then
+    echo "init: --client-id and --client-secret must be supplied together." >&2
+    return 1
+  fi
+
+  echo "== rclone4gdrive setup =="
+
+  # 1. Dependencies
+  echo ">> Checking dependencies..."
+  ensure_rclone || return 1
+  ensure_jq || return 1
+  ensure_linger || return 1
+
+  # 2. Local sync directory
+  mkdir -p "$SYNC_DIR"
+
+  # 3. Choose credentials (unless already decided by flags)
+  if [ -z "$INIT_CREDS_MODE" ]; then
+    echo
+    echo "Google credentials:"
+    echo "  - rclone's shared credentials: zero setup, fine for normal use (may rate-limit under heavy load)."
+    echo "  - your own client_id/secret: best for heavy use, requires a Google Cloud OAuth client."
+    if ask_yn "Use rclone's shared credentials (recommended for most users)?" y; then
+      INIT_CREDS_MODE=bundled
+    else
+      INIT_CREDS_MODE=custom
+      printf 'Google client_id: '; read -r INIT_CLIENT_ID
+      printf 'Google client_secret: '; read -r INIT_CLIENT_SECRET
+      if [ -z "$INIT_CLIENT_ID" ] || [ -z "$INIT_CLIENT_SECRET" ]; then
+        echo "Both client_id and client_secret are required."
+        return 1
+      fi
+    fi
+  fi
+
+  # 4. Authorize with Google (skip if already authorized)
+  echo
+  if remote_exists && remote_has_token; then
+    echo ">> '$REMOTE' is already authorized. Skipping OAuth."
+  else
+    echo ">> Authorizing with Google..."
+    do_oauth || { echo "OAuth did not complete."; return 1; }
+  fi
+
+  # 5. Verify the connection actually works
+  echo
+  echo ">> Verifying the connection..."
+  if "$RCLONE_BIN" about "${REMOTE}:" >/dev/null 2>&1; then
+    echo "  Connection verified."
+  else
+    echo "  Verification failed - the remote may not be authorized correctly."
+    return 1
+  fi
+
+  # 6. Deploy scripts
+  echo
+  echo ">> Deploying..."
+  deploy_scripts
+
+  # 7. Initial sync: establish the bisync baseline by downloading Drive into the
+  #    local folder. Without this, the first scheduled bisync would fail with
+  #    "Must run --resync to recover". For a fresh (empty) local folder this is a
+  #    pure Drive -> local download; nothing local can be lost.
+  echo
+  echo ">> Initial sync: downloading your Google Drive into $SYNC_DIR ..."
+  echo "   (one-time; may take a while for large Drives)"
+  # shellcheck disable=SC2086  # intentional word-splitting of BISYNC_COMMON_FLAGS
+  if "$RCLONE_BIN" bisync "${REMOTE}:" "$SYNC_DIR"/ --resync $BISYNC_COMMON_FLAGS --progress --log-level=INFO; then
+    echo "   Initial sync complete."
+  else
+    echo "   Initial sync did not fully finish. The hourly timer will retry, or run '$0 sync'."
+  fi
+
+  # 8. Install systemd units and arm the timer. We deliberately do NOT start
+  #    rclone.service here: the baseline is already set above, and starting the
+  #    service would just re-run a sync and (on a fresh pair) report a spurious
+  #    failure.
+  echo
+  echo ">> Installing systemd units and arming the hourly timer..."
+  sync_daemons_cmd || return 1
+
+  echo
+  echo "== Setup complete =="
+  echo "Your Google Drive is mirrored at: $SYNC_DIR"
+  echo "Sync runs hourly via the systemd timer. Use '$0 status' to check."
+  echo
+  echo "NOTE: a script cannot update THIS terminal's PATH. To use 'rclone4gdrive'"
+  echo "      here, run:  source ~/.bashrc   (a brand-new terminal already has it)."
+  return 0
+}
+
+# ===========================================================================
+# uninstall: remove everything rclone4gdrive installed (full clean)
+# ===========================================================================
+
+uninstall_cmd() {
+  FORCE=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yes) FORCE=1; shift ;;
+      -h|--help)
+        cat <<EOF
+Usage: $0 uninstall [options]
+
+Remove everything rclone4gdrive installed, returning the system to a fresh state:
+stop and delete the systemd units, remove the deployed scripts, drop the PATH
+line from ~/.bashrc, delete the rclone '$REMOTE' remote ($RCLONE_CONF is backed
+up first), and delete the local sync folder $SYNC_DIR. rclone/jq and user
+lingering are left in place (they are shared and may be used elsewhere).
+
+Options:
+  -y, --yes   Skip the confirmation prompt
+  -h, --help  Show this help
+EOF
+        return 0
+        ;;
+      *) echo "uninstall: unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  echo "== rclone4gdrive uninstall =="
+  echo "This will remove:"
+  echo "  - systemd units (rclone.timer/.service/-fail.service), stopped & deleted"
+  echo "  - deployed scripts at ~/bin/rclone4gdrive"
+  echo "  - the PATH line from ~/.bashrc"
+  echo "  - the rclone '$REMOTE' remote and its OAuth token ($RCLONE_CONF is backed up first)"
+  echo "  - the local sync folder $SYNC_DIR  (files stay on Google Drive;"
+  echo "    make sure any recent local-only changes have already synced up)"
+  echo
+  if [ "$FORCE" != 1 ]; then
+    ask_yn "Proceed with full uninstall?" n || { echo "Aborted. Nothing was changed."; return 0; }
+  fi
+
+  echo ">> Stopping and removing systemd units..."
+  systemctl --user stop    rclone.timer rclone.service rclone-fail.service 2>/dev/null
+  systemctl --user disable rclone.timer rclone-fail.service 2>/dev/null
+  rm -f "$HOME/.config/systemd/user/rclone.service" \
+        "$HOME/.config/systemd/user/rclone.timer" \
+        "$HOME/.config/systemd/user/rclone-fail.service" 2>/dev/null
+  systemctl --user daemon-reload 2>/dev/null
+  systemctl --user reset-failed 2>/dev/null
+
+  echo ">> Removing deployed scripts..."
+  rm -rf "$HOME/bin/rclone4gdrive"
+
+  echo ">> Removing PATH line from ~/.bashrc..."
+  if [ -f "$HOME/.bashrc" ]; then
+    # shellcheck disable=SC2016  # literal pattern: $HOME/$PATH are part of the line to match
+    if grep -vF 'export PATH="$HOME/bin/rclone4gdrive:$PATH"' "$HOME/.bashrc" > "$HOME/.bashrc.tmp"; then
+      mv "$HOME/.bashrc.tmp" "$HOME/.bashrc"
+    else
+      rm -f "$HOME/.bashrc.tmp"
+    fi
+  fi
+
+  echo ">> Removing the rclone '$REMOTE' remote..."
+  if "$RCLONE_BIN" listremotes 2>/dev/null | grep -q "^${REMOTE}:"; then
+    if [ -f "$RCLONE_CONF" ]; then
+      cp "$RCLONE_CONF" "$RCLONE_CONF.bak" && echo "  backed up $RCLONE_CONF -> $RCLONE_CONF.bak"
+    fi
+    printf 'y\n' | "$RCLONE_BIN" config delete "$REMOTE" 2>/dev/null || true
+    # Fallback: drop the [remote] section directly if `config delete` didn't remove it.
+    if "$RCLONE_BIN" listremotes 2>/dev/null | grep -q "^${REMOTE}:" && [ -f "$RCLONE_CONF" ]; then
+      awk -v remote="$REMOTE" 'BEGIN{d=0} $0=="["remote"]"{d=1;next} /^\[/{d=0} !d' \
+        "$RCLONE_CONF" > "$RCLONE_CONF.tmp" && mv "$RCLONE_CONF.tmp" "$RCLONE_CONF"
+    fi
+  else
+    echo "  '$REMOTE' remote not present; skipping."
+  fi
+
+  echo ">> Removing the local sync folder $SYNC_DIR..."
+  if [ -d "$SYNC_DIR" ]; then
+    rm -rf "$SYNC_DIR"
+  else
+    echo "  $SYNC_DIR not present; skipping."
+  fi
+
+  echo
+  echo "== Uninstall complete =="
+  echo "rclone/jq and user lingering were left installed (they may be used elsewhere)."
+  echo "To reinstall: clone the repository again and run ./rclone4gdrive init"
+  return 0
 }
 
 # --- Main argument parsing ---
@@ -148,7 +688,7 @@ if [ $# -lt 1 ]; then
 fi
 
 COMMAND=$1
-COMMAND=`echo "$COMMAND" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz'`
+COMMAND=$(echo "$COMMAND" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
 
 case "$COMMAND" in
   status)
@@ -163,12 +703,22 @@ case "$COMMAND" in
     sync_cmd
     ;;
 
+  sync-service)
+    sync_service_cmd
+    ;;
+
   sync-daemons)
     sync_daemons_cmd
     ;;
 
   init)
-    init_cmd
+    shift
+    init_cmd "$@"
+    ;;
+
+  uninstall)
+    shift
+    uninstall_cmd "$@"
     ;;
 
   help|-h|--help)
@@ -176,7 +726,7 @@ case "$COMMAND" in
     ;;
 
   *)
-    echo "Unknown command: $COMMAND"
+    echo "Unknown command: $COMMAND" >&2
     show_help
     exit 1
     ;;

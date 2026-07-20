@@ -2,21 +2,35 @@
 
 # refresh_token.sh
 #
-# Purpose: Refresh the Google Drive OAuth access token in rclone.conf using the stored refresh token.
-# This script is intended to be called manually or by automation when the rclone token is expired or near expiry.
-# It extracts credentials from rclone.conf, requests a new access token, updates the config, and verifies the result using rclone4gdrive.
+# Purpose: Refresh the Google Drive OAuth access token in rclone.conf using the
+# stored refresh token. Called manually or by rclone-fail-handler.sh when the
+# rclone token is expired or revoked. It extracts credentials from rclone.conf,
+# requests a new access token, updates the config, and verifies the result with
+# a non-destructive dry-run.
+#
+# Shared settings (REMOTE, RCLONE_BIN, SYNC_DIR, BISYNC_COMMON_FLAGS) come from
+# config.sh, sourced below.
 
-# --- CONFIG ---
-REMOTE="gdrive"
-RCLONE_CONF="${HOME}/.config/rclone/rclone.conf"
+# Resolve this script's directory (works even when invoked via PATH) and load
+# shared configuration.
+case "$0" in
+  */*) _self=$0 ;;
+  *)
+    _self=$(command -v "$0")
+    [ -n "$_self" ] || _self="./$0"
+    ;;
+esac
+SCRIPT_DIR=$(unset CDPATH; cd "$(dirname -- "$_self")" && pwd)
+# shellcheck disable=SC1090  # dynamic path; config.sh ships next to this script
+. "$SCRIPT_DIR/config.sh"
 
 # --- EXTRACT VALUES FROM rclone.conf ---
 # Extract client_id from the config file
-CLIENT_ID=`awk -F= '$1 ~ /client_id/ {gsub(/[ \t]/, "", $2); print $2; exit}' "$RCLONE_CONF"`
+CLIENT_ID=$(awk -F= '$1 ~ /client_id/ {gsub(/[ \t]/, "", $2); print $2; exit}' "$RCLONE_CONF")
 # Extract client_secret from the config file
-CLIENT_SECRET=`awk -F= '$1 ~ /client_secret/ {gsub(/[ \t]/, "", $2); print $2; exit}' "$RCLONE_CONF"`
+CLIENT_SECRET=$(awk -F= '$1 ~ /client_secret/ {gsub(/[ \t]/, "", $2); print $2; exit}' "$RCLONE_CONF")
 # Extract refresh_token from the token JSON in the config file
-REFRESH_TOKEN=`awk -F= '$1 ~ /token/ {print $2; exit}' "$RCLONE_CONF" | jq -r '.refresh_token'`
+REFRESH_TOKEN=$(awk -F= '$1 ~ /token/ {print $2; exit}' "$RCLONE_CONF" | jq -r '.refresh_token')
 
 # --- CHECK ---
 # Ensure all required credentials were extracted
@@ -30,11 +44,11 @@ fi
 # The POST body is piped through stdin (not passed as command-line -d flags) so
 # that the client_secret and refresh_token are not exposed to other users via ps.
 BODY="client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}&refresh_token=${REFRESH_TOKEN}&grant_type=refresh_token"
-TOKEN=`printf '%s' "$BODY" | curl -s -X POST -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @- https://oauth2.googleapis.com/token`
+TOKEN=$(printf '%s' "$BODY" | curl -s -X POST -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @- https://oauth2.googleapis.com/token)
 
 # Extract access_token and expires_in from the response
-ACCESS_TOKEN=`echo "$TOKEN" | jq -r '.access_token'`
-EXPIRES_IN=`echo "$TOKEN" | jq -r '.expires_in'`
+ACCESS_TOKEN=$(echo "$TOKEN" | jq -r '.access_token')
+EXPIRES_IN=$(echo "$TOKEN" | jq -r '.expires_in')
 
 # --- CHECK ---
 # Ensure the access token and expiry were obtained
@@ -46,18 +60,18 @@ fi
 # --- BUILD EXPIRY STRING IN RCLONE FORMAT ---
 # Calculate expiry in seconds since epoch using the REAL lifetime Google
 # returned (expires_in), not a hardcoded value.
-NOW=`date +%s`
+NOW=$(date +%s)
 EXPIRY_EPOCH=$(( NOW + EXPIRES_IN ))
 # Format expiry as ISO 8601 with fractional seconds and local timezone
-EXPIRY=`date --date="@$EXPIRY_EPOCH" +"%Y-%m-%dT%H:%M:%S.%N%:z"`
+EXPIRY=$(date --date="@$EXPIRY_EPOCH" +"%Y-%m-%dT%H:%M:%S.%N%:z")
 
 # --- BUILD JSON FOR RCLONE TOKEN FIELD ---
 # Construct the new token JSON for rclone.conf
-NEW_TOKEN=`jq -nc \
+NEW_TOKEN=$(jq -nc \
   --arg at "$ACCESS_TOKEN" \
   --arg rt "$REFRESH_TOKEN" \
   --arg exp "$EXPIRY" \
-  '{"access_token": $at,"token_type": "Bearer","refresh_token": $rt,"expiry": $exp}'`
+  '{"access_token": $at,"token_type": "Bearer","refresh_token": $rt,"expiry": $exp}')
 
 # --- BACKUP CONFIG ---
 # Backup the current rclone.conf before making changes
@@ -78,7 +92,8 @@ sed -i "/^\[${REMOTE}\]/,/^\[/ s|^token =.*|token = ${NEW_TOKEN}|" "$RCLONE_CONF
 # Verify the new token works with a dry-run bisync. A dry-run authenticates
 # against Google Drive (proving the token is valid) without writing, deleting,
 # or modifying any files on either side.
-if /usr/bin/rclone bisync gdrive: "$HOME/gdrive" --dry-run --drive-skip-gdocs --create-empty-src-dirs --log-level=ERROR; then
+# shellcheck disable=SC2086  # intentional word-splitting of BISYNC_COMMON_FLAGS
+if "$RCLONE_BIN" bisync "${REMOTE}:" "$SYNC_DIR" --dry-run $BISYNC_COMMON_FLAGS --log-level=ERROR; then
   echo "Dry-run succeeded. Configuration updated."
   rm -f "$RCLONE_CONF.bak"
 else
