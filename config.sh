@@ -16,6 +16,9 @@
 # Edit the variables below to change the remote name, the local sync
 # directory, or the common rclone bisync flags used across the whole system.
 
+# rclone4gdrive version (keep in sync with git tags and the README badge).
+VERSION="1.0.0"
+
 # Name of the rclone remote, as created by `rclone config` (default: gdrive).
 REMOTE="gdrive"
 

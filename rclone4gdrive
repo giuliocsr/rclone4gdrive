@@ -41,6 +41,7 @@ Commands:
   init           Guided setup: dependencies, Google OAuth, validation, deploy + systemd units (run 'init --help' for options)
   uninstall      Remove everything rclone4gdrive installed: units, scripts, PATH entry, the gdrive remote (backed up), and ~/gdrive
   help, -h, --help  Show this help message
+  --version, -V     Show the version
 EOF
 }
 
@@ -687,6 +688,11 @@ if [ $# -lt 1 ]; then
   exit 1
 fi
 
+# --version / -V short-circuit before normal command parsing.
+case "$1" in
+  --version|-V) echo "rclone4gdrive $VERSION"; exit 0 ;;
+esac
+
 COMMAND=$1
 COMMAND=$(echo "$COMMAND" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
 
@@ -723,6 +729,10 @@ case "$COMMAND" in
 
   help|-h|--help)
     show_help
+    ;;
+
+  version)
+    echo "rclone4gdrive $VERSION"
     ;;
 
   *)
