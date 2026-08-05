@@ -10,7 +10,7 @@
 ```
 
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/giuliocsr/rclone4gdrive/releases)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/giuliocsr/rclone4gdrive/releases)
 [![Lint](https://github.com/giuliocsr/rclone4gdrive/actions/workflows/lint.yml/badge.svg)](https://github.com/giuliocsr/rclone4gdrive/actions/workflows/lint.yml)
 
 > Please, help me in leading this project! Look at `CONTRIBUTING.md` for how to contribute.
@@ -111,7 +111,7 @@ rclone4gdrive init --client-id 1234-abc.apps.googleusercontent.com --client-secr
 
 After installation, you can use the following commands:
 ```sh
-rclone4gdrive status        # Show timer/service status and the health of sync + authorization
+rclone4gdrive status        # Show timer/service/auth health, Drive storage usage and synced size
 rclone4gdrive restart       # Restart the timer and start the service immediately
 rclone4gdrive sync          # Run a real two-way rclone bisync now (Google Drive <-> ~/gdrive)
 rclone4gdrive sync-daemons  # (Re)install and enable the systemd user units

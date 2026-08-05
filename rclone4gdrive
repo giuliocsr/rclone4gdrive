@@ -34,7 +34,7 @@ show_help() {
 Usage: $0 <command>
 
 Commands:
-  status         Show a compact summary of rclone.timer and the last 10 lines of the rclone.service journal
+  status         Show timer/service/auth health plus Drive storage usage and locally-synced size
   restart        Restart rclone.timer and start rclone.service immediately
   sync           Run rclone bisync to synchronize your Google Drive and local directory
   sync-daemons   Install service/timer unit files from daemons/ into ~/.config/systemd/user, reload and enable/start them
@@ -67,7 +67,7 @@ rel_time() {
 }
 
 # Run a command with a hard wall-clock cap if the `timeout` command is present.
-# Used so `status` can never hang on a slow network call (e.g. `rclone about`).
+# Used so the background about-fetcher can never hang.
 timed_run() {
   _secs=$1; shift
   if command -v timeout >/dev/null 2>&1; then
@@ -77,8 +77,50 @@ timed_run() {
   fi
 }
 
+# Print <bytes> as decimal GB with 2 decimals (e.g. 3.15 -> "3.15"). The two
+# digits after the point are the MB. Decimal units match Google Drive's own
+# quota display (1 GB = 10^9 bytes).
+gb() { awk -v b="${1:-0}" 'BEGIN { printf "%.2f", b/1000000000.0 }'; }
+
+# Print the integer percent of used/total, or "—" when total is 0 (unlimited
+# plans) or missing/unparseable.
+pct() {
+  _u=${1:-0}; _t=${2:-0}
+  [ "$_t" -gt 0 ] 2>/dev/null || { printf '%s' "—"; return; }
+  awk -v u="$_u" -v t="$_t" 'BEGIN { printf "%.0f", (u/t)*100 }'
+}
+
+# Report the freshness of the cached `rclone about` JSON: "fresh", "stale",
+# or "missing". The cache mtime always marks a real, successful Drive contact.
+about_cache_state() {
+  [ -f "$ABOUT_CACHE" ] || { echo missing; return; }
+  _mt=$(date -r "$ABOUT_CACHE" +%s 2>/dev/null || echo 0)
+  [ $(( $(date +%s) - _mt )) -lt "${ABOUT_TTL:-3600}" ] && echo fresh || echo stale
+}
+
+# Refresh the cached `about` JSON in the background so `status` never blocks.
+# Dedup'd: a fetch started in the last 60s counts as in flight. Writes are
+# atomic and only on success, so a failed/slow fetch never corrupts the cache
+# or moves its mtime. ABOUT_FIRSTTRY tracks the start of a failure streak so
+# Auth can eventually report unreachable (cleared on success).
+refresh_about_cache() {
+  mkdir -p "$ABOUT_CACHE_DIR"
+  if [ -f "$ABOUT_LASTTRY" ]; then
+    _lt=$(date -r "$ABOUT_LASTTRY" +%s 2>/dev/null || echo 0)
+    [ $(( $(date +%s) - _lt )) -lt 60 ] && return 0
+  fi
+  date +%s > "$ABOUT_LASTTRY"
+  [ -f "$ABOUT_FIRSTTRY" ] || date +%s > "$ABOUT_FIRSTTRY"
+  (
+    if _j=$(timed_run 60 "$RCLONE_BIN" about "${REMOTE}:" --json 2>/dev/null); then
+      printf '%s' "$_j" > "$ABOUT_CACHE.tmp" && mv -f "$ABOUT_CACHE.tmp" "$ABOUT_CACHE"
+      rm -f "$ABOUT_FIRSTTRY"
+    fi
+  ) </dev/null >/dev/null 2>&1 &
+}
+
 status_cmd() {
-  OK="${STATUS_OK:-✓}"; BAD="${STATUS_BAD:-✗}"
+  OK="${STATUS_OK:-✓}"; BAD="${STATUS_BAD:-✗}"; PENDING="${STATUS_PENDING:-…}"
   echo "rclone4gdrive status"
   echo
 
@@ -131,17 +173,74 @@ status_cmd() {
   fi
   printf '  %-10s %s  %s\n' "Last sync" "$sync_sym" "$sync_detail"
 
-  # ---- Auth ---- (bounded network call; cannot hang status)
+  # ---- Auth + Drive usage (cached `rclone about`; refreshed in background) ----
+  # `status` never blocks on the network. The Drive quota/usage JSON is cached
+  # locally and refreshed by a detached background job; token *presence* is a
+  # fast local check and Drive *reachability* is inferred from a recent
+  # successful cache write. (A genuinely dead token also surfaces as a failed
+  # hourly sync on the Last sync line, so Auth doesn't need a live probe.)
+  synced_bytes=$(du -sb "$SYNC_DIR" 2>/dev/null | awk '{print $1}')
+  [ -n "$synced_bytes" ] || synced_bytes=0
+  synced_gb=$(gb "$synced_bytes")
+  _st=$(about_cache_state)   # fresh | stale | missing
+
+  # -- Auth --
   if remote_has_token; then
-    if timed_run 8 "$RCLONE_BIN" about "${REMOTE}:" >/dev/null 2>&1; then
-      auth_sym=$OK; auth_ok=1; auth_detail="token works (reached Google Drive)"
-    else
-      auth_sym=$BAD; auth_ok=0; auth_detail="token present but Drive unreachable (expired, offline, or timed out)"
-    fi
+    case "$_st" in
+      fresh)
+        auth_sym=$OK; auth_ok=1
+        auth_detail="token works (reached Google Drive)"
+        ;;
+      stale)
+        auth_sym=$OK; auth_ok=1
+        auth_detail="token present (rechecking Drive connection)"
+        refresh_about_cache
+        ;;
+      missing)
+        refresh_about_cache
+        if [ -f "$ABOUT_FIRSTTRY" ] && \
+           [ $(( $(date +%s) - $(date -r "$ABOUT_FIRSTTRY" +%s 2>/dev/null || echo 0) )) -ge "${ABOUT_FAIL:-600}" ]; then
+          auth_sym=$BAD; auth_ok=0
+          auth_detail="Drive unreachable (token expired or offline); retrying in background"
+        else
+          auth_sym=$PENDING; auth_ok=1
+          auth_detail="checking Drive connection — re-run in a moment"
+        fi
+        ;;
+    esac
   else
     auth_sym=$BAD; auth_ok=0; auth_detail="no token (not authorized)"
   fi
   printf '  %-10s %s  %s\n' "Auth" "$auth_sym" "$auth_detail"
+
+  # -- Drive usage + locally-synced size --
+  # The synced size is the local mirror; it is <= cloud usage because Google
+  # Docs/Sheets/Slides are skipped (--drive-skip-gdocs).
+  case "$_st" in
+    fresh|stale)
+      used=$(jq -r '.used // empty' "$ABOUT_CACHE" 2>/dev/null)
+      total=$(jq -r '.total // empty' "$ABOUT_CACHE" 2>/dev/null)
+      if [ -n "$used" ] && [ -n "$total" ]; then
+        if [ "$total" -gt 0 ] 2>/dev/null; then
+          drive_sym=$OK
+          drive_detail=$(printf '%s GB / %s GB (%s%%). %s GB Synced locally' \
+            "$(gb "$used")" "$(gb "$total")" "$(pct "$used" "$total")" "$synced_gb")
+        else
+          drive_sym=$OK
+          drive_detail=$(printf '%s GB used (unlimited). %s GB Synced locally' \
+            "$(gb "$used")" "$synced_gb")
+        fi
+      else
+        drive_sym=$PENDING
+        drive_detail="loading Drive usage — re-run in a moment"
+      fi
+      ;;
+    missing)
+      drive_sym=$PENDING
+      drive_detail="loading Drive usage — re-run in a moment"
+      ;;
+  esac
+  printf '  %-10s %s  %s\n' "Drive" "$drive_sym" "$drive_detail"
 
   # ---- Verdict ----
   echo "  ───────────────────────────────────────"

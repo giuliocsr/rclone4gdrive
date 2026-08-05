@@ -17,7 +17,7 @@
 # directory, or the common rclone bisync flags used across the whole system.
 
 # rclone4gdrive version (keep in sync with git tags and the README badge).
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # Name of the rclone remote, as created by `rclone config` (default: gdrive).
 REMOTE="gdrive"
@@ -38,3 +38,13 @@ RCLONE_CONF="$HOME/.config/rclone/rclone.conf"
 # context-specific flags (--progress, --log-level, --resync, --dry-run) on top.
 # This is intentionally a space-separated string that callers word-split.
 BISYNC_COMMON_FLAGS="--drive-skip-gdocs --create-empty-src-dirs"
+
+# Cache for `status`: the JSON from `rclone about` is fetched in the background
+# and stored here, so the Drive usage line is instant and never blocks `status`.
+ABOUT_CACHE_DIR="$HOME/.cache/rclone4gdrive"
+ABOUT_CACHE="$ABOUT_CACHE_DIR/about.json"        # last successful about JSON
+ABOUT_LASTTRY="$ABOUT_CACHE_DIR/about.lasttry"   # mtime = start of last fetch
+ABOUT_FIRSTTRY="$ABOUT_CACHE_DIR/about.firsttry"  # mtime = first try of the current failure streak (cleared on success)
+ABOUT_TTL=3600   # seconds a cached `about` is considered fresh (1h)
+ABOUT_FAIL=600   # seconds of non-stop fetch failure before Auth reports ✗ (10m)
+
