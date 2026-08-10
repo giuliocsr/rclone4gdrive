@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the author."
+title: "rclone4gdrive"
+authors:
+  - family-names: Golinelli
+    given-names: Giulio
+type: software
+url: "https://github.com/giuliocsr/rclone4gdrive"
+date-released: "2024"
+license: "CC-BY-NC-SA-4.0"
