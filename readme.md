@@ -127,8 +127,8 @@ rclone4gdrive help          # Show this help message
 ## Directory structure
 - `rclone4gdrive`           : Main script / entrypoint (contains the guided `init`)
 - `config.sh`               : Shared configuration (remote name, sync dir, rclone paths, common bisync flags) sourced by every script
-- `refresh_token.sh`        : Refreshes the OAuth token and updates `rclone.conf`
-- `rclone-fail-handler.sh`  : Handles sync failures and triggers recovery
+- `refresh_token.sh`        : Manually refreshes the OAuth token and updates `rclone.conf` (diagnostic tool; rclone renews tokens by itself)
+- `rclone-fail-handler.sh`  : Classifies sync failures and recovers what it can
 - `daemons/`                : systemd user unit files
 	- `rclone.service`         : Runs the bisync via an internal helper command
 	- `rclone.timer`           : Schedules regular syncs (hourly)
@@ -148,11 +148,11 @@ rclone4gdrive help          # Show this help message
 5. *Initial sync.* It runs a one-time `rclone bisync --resync` to download your Drive into the (empty) local folder, establishing the bisync baseline so the first scheduled sync succeeds instead of failing with "must run --resync".
 6. *Deploy.* Finally it copies the scripts to `~/bin/rclone4gdrive/`, adds that directory to your `PATH` via `~/.bashrc`, installs the systemd units, and arms the timer.
 
-**Token lifecycle.** The one-time consent produces a refresh token stored in `rclone.conf`. Access tokens expire after about an hour; when they do, `refresh_token.sh` uses the refresh token to get a new one, updates `rclone.conf` (with backup + rollback, verified by a non-destructive dry-run). So after that single click, renewal is fully automatic forever.
+**Token lifecycle.** The one-time consent produces a refresh token stored in `rclone.conf`. Access tokens expire after about an hour; rclone renews them by itself using the refresh token on every sync. So after that single click, renewal is fully automatic forever. (`refresh_token.sh` can also renew a token by hand — with backup + rollback, verified by a non-destructive dry-run — but it is a diagnostic tool for when rclone's own renewal misbehaves, not part of the normal loop. Note it needs a `client_id`/`client_secret` in `rclone.conf`, so it only applies when `init` was run with your own OAuth client.)
 
 **The hourly sync.** `rclone.timer` fires `rclone.service`, which runs the bisync. Rather than duplicate the bisync flags inside the unit (which can drift out of sync with the scripts), the unit delegates to an internal command — `rclone4gdrive sync-service` — that sources `config.sh`. That command is deliberately omitted from `rclone4gdrive help` and you never run it yourself; it's plumbing. The unit is `Type=oneshot`, so any non-zero exit is treated as failure, which is what triggers recovery.
 
-**Failure recovery.** If a sync fails, `OnFailure=rclone-fail.service` runs `rclone-fail-handler.sh`. It inspects the last journal lines for known error patterns and acts: an expired/revoked token triggers `refresh_token.sh`; a "must run --resync" condition triggers a `--resync`. If recovery succeeds, it restarts the timer; otherwise it leaves the timer stopped and asks for manual intervention.
+**Failure recovery.** If a sync fails, `OnFailure=rclone-fail.service` runs `rclone-fail-handler.sh`, which classifies the error from the last journal lines. Transient network failures (DNS blips, timeouts, refused connections) are left alone: the timer stays armed and the next hourly sync retries. A "must run --resync" condition triggers a `--resync`, with the timer paused around it so the hourly trigger can't race the resync, and restarted afterwards. Auth failures (expired/revoked token) can't retry their way out, so the journal gets re-authorization instructions while the timer stays armed — syncing resumes by itself once you re-authorize. Unknown failures also leave the timer running, so a failed sync never silently disables scheduled syncing.
 
 **Single source of truth.** Every bisync invocation — the timer, manual `sync`, failure-recovery resync, and the token-check dry-run — reads `REMOTE`, `SYNC_DIR`, `RCLONE_BIN`, and `BISYNC_COMMON_FLAGS` from `config.sh`. Change one line there and all of them update together; there are no duplicated flags to keep in agreement.
 

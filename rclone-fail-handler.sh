@@ -2,11 +2,22 @@
 
 # rclone-fail-handler.sh
 #
-# Called by rclone-fail.service. It stops rclone.timer to prevent further
-# scheduled runs, inspects recent logs for known failure patterns, and attempts
-# automated recovery such as refreshing the OAuth token or running a --resync.
-# On success it restarts the timer/service; otherwise it leaves the timer
-# stopped and instructs the user to intervene manually.
+# Called by rclone-fail.service when rclone.service exits non-zero. It inspects
+# the last journal lines and classifies the failure:
+#
+#   - Transient network errors (DNS, TCP, timeouts): the timer is left
+#     running; the next hourly sync retries on its own.
+#   - "Must run --resync to recover.": the timer is stopped while a --resync
+#     runs (so the hourly trigger cannot race it), then restarted on success.
+#   - Auth errors (invalid_grant, expired/revoked token): retrying cannot
+#     succeed until the user re-authorizes; the journal gets instructions and
+#     the timer stays armed so syncing self-heals after re-auth.
+#   - Anything else: unknown failure; the timer stays armed and the failure
+#     remains visible in `rclone4gdrive status` until a sync succeeds.
+#
+# The timer is only ever stopped around the --resync attempt, so a single
+# failed sync can never silently disable scheduled syncing (a past one-off DNS
+# failure used to leave the timer stopped for good).
 #
 # Shared settings (REMOTE, RCLONE_BIN, SYNC_DIR, BISYNC_COMMON_FLAGS) come from
 # config.sh, sourced below.
@@ -35,34 +46,56 @@ restart_services() {
   exit 0
 }
 
-# Stop the timer immediately to avoid further scheduled runs while we handle the failure.
-systemctl --user stop rclone.timer || true
+# Collect journal lines for the rclone service, scoped to the failed run.
+# This handler fires seconds after the failure (OnFailure=), so a short
+# time window reliably captures the failed run's error lines while excluding
+# errors from earlier runs that may still linger in the tail of the journal
+# (a silent successful sync leaves no rclone lines, so a purely line-counted
+# window could reach back days and act on a stale error).
+JOURNAL_OUTPUT=$(journalctl --user -u rclone.service --since=-15min -n 30 --no-pager 2>/dev/null || true)
 
-# Collect recent journal lines for the rclone service (last 10 lines).
-JOURNAL_OUTPUT=$(journalctl --user -u rclone.service -n 10 --no-pager 2>/dev/null || true)
-
-# --- OAuth/token error handling block ---
-if echo "$JOURNAL_OUTPUT" | grep -E -q "couldn't fetch token|invalid_grant|Token has been expired or revoked|couldn't find root directory ID"; then
-  echo "Detected invalid token in logs. Attempting refresh..."
-  if "$SCRIPT_DIR/refresh_token.sh"; then
-    restart_services
-  else
-    echo "refresh token failed."
-  fi
+# --- Transient network errors ---
+# Checked FIRST: network failures often embed token-related text (a DNS error
+# while rclone fetches a token reads "... couldn't fetch token: ... server
+# misbehaving"), so they must not be mistaken for an auth problem.
+if echo "$JOURNAL_OUTPUT" | grep -E -q "dial tcp|no such host|server misbehaving|Temporary failure in name resolution|network is unreachable|connection refused|connection reset by peer|context deadline exceeded|Client\.Timeout|i/o timeout|TLS handshake timeout"; then
+  echo "Transient network failure detected. Leaving rclone.timer running; the next scheduled sync will retry."
+  exit 0
 fi
 
-# Check for the "Must run --resync to recover." error in the logs.
+# --- Bisync resync-required handling ---
+# A --resync can run long on large trees, so stop the timer first to keep the
+# hourly trigger from racing it; restart everything on success, leave the timer
+# stopped (asking for manual intervention) on failure.
 if echo "$JOURNAL_OUTPUT" | grep -q "Must run --resync to recover."; then
   echo "Detected 'Must run --resync to recover.' in logs. Attempting resync..."
+  systemctl --user stop rclone.timer || true
   # Attempt to recover by running rclone with --resync (common flags from config.sh).
   # shellcheck disable=SC2086  # intentional word-splitting of BISYNC_COMMON_FLAGS
   if "$RCLONE_BIN" bisync "${REMOTE}:" "$SYNC_DIR"/ --resync $BISYNC_COMMON_FLAGS --log-level=ERROR; then
     restart_services
   else
-    echo "rclone --resync failed."
+    echo "rclone --resync failed. Timer left stopped to avoid repeating a broken resync; run: rclone4gdrive status"
+    exit 1
   fi
-else
-  # No known recoverable error found; inform the user and exit.
-  echo "No OAuth/token error or resync required detected in recent logs. Timer has been stopped as part of failure handling."
+fi
+
+# --- Auth errors ---
+# rclone refreshes access tokens by itself whenever the network is up, so
+# invalid_grant / a revoked refresh token only clears after manual
+# re-authorization. Keep the timer armed: once the user re-authorizes, the
+# next scheduled sync resumes syncing without any further action.
+if echo "$JOURNAL_OUTPUT" | grep -E -q "invalid_grant|Token has been expired or revoked|invalid_client"; then
+  echo "Auth failure detected (token rejected, expired, or revoked). Re-authorize with:"
+  echo "  rclone config reconnect ${REMOTE}:   (or re-run: rclone4gdrive init)"
+  echo "The timer stays armed; syncing resumes automatically after re-authorization."
   exit 0
 fi
+
+# --- Unknown failures ---
+# Not a known pattern: leave the timer running. A transient cause self-heals on
+# the next hourly run; a persistent one keeps failing visibly in
+# `rclone4gdrive status` without ever disabling scheduled syncing.
+echo "Sync failed with an unrecognized error. Timer left running; next scheduled sync will retry."
+echo "Inspect: journalctl --user -u rclone.service"
+exit 0
